@@ -5,6 +5,9 @@
  *   ・チャット: ワールド全体 / パーティーだけ
  *   ゲームの計算はしません。受け取ったメッセージを渡すだけです。 */
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 10000;
@@ -16,10 +19,93 @@ const rooms = new Map();     // ワールド名 → { members: Map(id → ws), p
 const stashes = new Map();   // ワールド名/パーティー名 → { ver, items: [{ item, w, h }] }
 let nextId = 1;
 
+/* ============================================================
+ * 保存先(アカウントとセーブ)
+ *   Render の「Environment」に UPSTASH_REDIS_REST_URL と UPSTASH_REDIS_REST_TOKEN があれば Upstash(無料・消えない)
+ *   なければサーバーのファイル(無料プランでは、サーバーが入れ替わると消える)
+ * ============================================================ */
+const KV_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, ''), KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const FILE_DB = path.join(__dirname, 'data.json');
+let fileDb = null;
+function fileLoad() { if (!fileDb) { try { fileDb = JSON.parse(fs.readFileSync(FILE_DB, 'utf8')); } catch (e) { fileDb = {}; } } return fileDb; }
+let fileSaveT = null;
+function fileSave() { clearTimeout(fileSaveT); fileSaveT = setTimeout(() => { try { fs.writeFileSync(FILE_DB, JSON.stringify(fileDb)); } catch (e) { console.error(e); } }, 500); }
+async function kv(cmd) {
+  if (KV_URL) {
+    const r = await fetch(KV_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + KV_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(cmd) });
+    const j = await r.json(); if (j.error) throw new Error(j.error); return j.result;
+  }
+  const db = fileLoad(), [op, key, val] = cmd, now = Date.now();
+  if (op === 'GET') { const e = db[key]; if (!e || (e.x && e.x < now)) return null; return e.v; }
+  if (op === 'SET') { const ex = cmd[3] === 'EX' ? now + cmd[4] * 1000 : 0; db[key] = { v: val, x: ex }; fileSave(); return 'OK'; }
+  if (op === 'DEL') { delete db[key]; fileSave(); return 1; }
+  throw new Error('unknown op');
+}
+const STORAGE = KV_URL ? 'upstash' : 'file';
+const TOKEN_DAYS = 90;
+const hashPass = (pass, salt) => new Promise((ok, ng) => crypto.scrypt(pass, salt, 32, (e, k) => e ? ng(e) : ok(k.toString('hex'))));
+const userKey = u => 'user:' + u, saveKey = u => 'save:' + u, tokKey = t => 'tok:' + t;
+const cleanUser = s => String(s || '').trim().normalize('NFKC').toLowerCase();
+const validUser = u => /^[a-z0-9_\-぀-ヿ㐀-鿿]{2,16}$/.test(u);
+const fails = new Map();   // ログイン失敗の回数(同じ場所から何度も試されるのを防ぐ)
+function tooMany(ip) { const f = fails.get(ip); return f && f.n >= 10 && Date.now() - f.t < 10 * 60 * 1000; }
+function failed(ip) { const f = fails.get(ip) || { n: 0, t: 0 }; if (Date.now() - f.t > 10 * 60 * 1000) f.n = 0; f.n++; f.t = Date.now(); fails.set(ip, f); }
+async function newToken(user) { const t = crypto.randomBytes(24).toString('hex'); await kv(['SET', tokKey(t), user, 'EX', TOKEN_DAYS * 86400]); return t; }
+async function authUser(req) { const h = req.headers.authorization || ''; const t = h.startsWith('Bearer ') ? h.slice(7) : ''; if (!/^[0-9a-f]{48}$/.test(t)) return null; return await kv(['GET', tokKey(t)]); }
+
+function readBody(req, max) {
+  return new Promise((ok, ng) => { let n = 0; const ch = []; req.on('data', d => { n += d.length; if (n > max) { ng(new Error('too large')); req.destroy(); } else ch.push(d); }); req.on('end', () => ok(Buffer.concat(ch).toString('utf8'))); req.on('error', ng); });
+}
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
+function json(res, code, o) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS }); res.end(JSON.stringify(o)); }
+function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 3, worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, storage: STORAGE, game: fs.existsSync(GAME_FILE) }; }
+const GAME_FILE = path.join(__dirname, 'abyss-arpg.html');
+
+async function api(req, res, url) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  try {
+    if (url === '/api/register' || url === '/api/login') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST で送ってください' });
+      if (tooMany(ip)) return json(res, 429, { error: '失敗が多すぎます。10分ほど待ってください' });
+      const b = JSON.parse(await readBody(req, 10000) || '{}'), user = cleanUser(b.user), pass = String(b.pass || '');
+      if (!validUser(user)) return json(res, 400, { error: 'IDは2〜16文字(英数字・ひらがな・カタカナ・漢字・_ -)にしてください' });
+      if (pass.length < 6 || pass.length > 64) return json(res, 400, { error: 'パスワードは6〜64文字にしてください' });
+      const cur = await kv(['GET', userKey(user)]);
+      if (url === '/api/register') {
+        if (cur) { failed(ip); return json(res, 409, { error: 'そのIDはもう使われています' }); }
+        const salt = crypto.randomBytes(16).toString('hex'), hash = await hashPass(pass, salt);
+        await kv(['SET', userKey(user), JSON.stringify({ salt, hash, created: Date.now() })]);
+        return json(res, 200, { ok: true, user, token: await newToken(user) });
+      }
+      if (!cur) { failed(ip); return json(res, 401, { error: 'IDかパスワードがちがいます' }); }
+      const u = JSON.parse(cur), h = await hashPass(pass, u.salt);
+      if (!crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(u.hash, 'hex'))) { failed(ip); return json(res, 401, { error: 'IDかパスワードがちがいます' }); }
+      return json(res, 200, { ok: true, user, token: await newToken(user) });
+    }
+    if (url === '/api/logout') { const h = req.headers.authorization || ''; if (h.startsWith('Bearer ')) await kv(['DEL', tokKey(h.slice(7))]); return json(res, 200, { ok: true }); }
+    if (url === '/api/save') {
+      const user = await authUser(req); if (!user) return json(res, 401, { error: 'ログインし直してください' });
+      if (req.method === 'GET') { const s = await kv(['GET', saveKey(user)]); return json(res, 200, s ? { ok: true, user, ...JSON.parse(s) } : { ok: true, user, t: 0, data: null }); }
+      if (req.method === 'POST') {
+        const b = JSON.parse(await readBody(req, 4 * 1024 * 1024) || '{}');
+        if (typeof b.data !== 'string' || !(b.t > 0)) return json(res, 400, { error: 'セーブの形が正しくありません' });
+        await kv(['SET', saveKey(user), JSON.stringify({ t: b.t, data: b.data, z: b.z ? 1 : 0, saved: Date.now() })]);
+        return json(res, 200, { ok: true });
+      }
+    }
+    return json(res, 404, { error: 'not found' });
+  } catch (e) { console.error(e); return json(res, 500, { error: 'サーバーでエラーが起きました: ' + e.message }); }
+}
+
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-  let players = 0; for (const r of rooms.values()) players += r.members.size;
-  res.end(JSON.stringify({ ok: true, name: 'abyss-relay', version: 2, worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX }));
+  const url = (req.url || '/').split('?')[0];
+  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
+  if (url.startsWith('/api/')) return api(req, res, url);
+  if ((url === '/' || url === '/index.html' || url === '/play') && fs.existsSync(GAME_FILE)) {   // ゲームそのものを配る(ブラウザで開くだけで遊べる)
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+    return fs.createReadStream(GAME_FILE).pipe(res);
+  }
+  return json(res, 200, status());
 });
 const wss = new WebSocketServer({ server, maxPayload: MAX_MSG });
 const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(typeof o === 'string' ? o : JSON.stringify(o)); };
@@ -133,4 +219,4 @@ wss.on('connection', ws => {
 });
 
 setInterval(() => { for (const ws of wss.clients) { if (!ws.alive) { ws.terminate(); continue; } ws.alive = false; ws.ping(); } }, 25000);
-server.listen(PORT, () => console.log(`abyss-relay v2 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`abyss-relay v3 listening on ${PORT} (storage: ${STORAGE})`));

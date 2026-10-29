@@ -1,8 +1,9 @@
-/* 深淵の刻印 — マルチプレイ用の中継サーバー(abyss-relay) v2
- *   ・ワールド(合言葉)ごとに最大 MAX_PLAYERS 人。町では全員が見える
+/* 深淵の刻印 — マルチプレイ用の中継サーバー(abyss-relay) v4
+ *   ・ワールド(合言葉)ごとに最大 MAX_PLAYERS 人。町では全員が見える。ワールドはリーグ(永続 / その月のシーズン)ごとに別
  *   ・ワールドの中でパーティー(最大 PARTY_MAX 人)を組むと、エリアを一緒に攻略できる。パーティーのリーダーのゲームが敵を動かす
- *   ・パーティー倉庫: パーティー名ごとにアイテムを預けられる(サーバーの記憶+各自のゲームにも控え)
+ *   ・トレード: 2人が出す物を決めて、両方が OK すると中身を交換する(サーバーが仲立ちする)
  *   ・チャット: ワールド全体 / パーティーだけ
+ *   ・開発者: Render の Environment の DEV_USERS(カンマ区切りのID)に書いたアカウントは、ゲームの開発者メニューと Excel が使える
  *   ゲームの計算はしません。受け取ったメッセージを渡すだけです。 */
 const http = require('http');
 const fs = require('fs');
@@ -13,11 +14,16 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 10000;
 const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 32);
 const PARTY_MAX = Number(process.env.PARTY_MAX || 4);
-const STASH_W = 12, STASH_H = 8;
+const SEASON_TZ = Number(process.env.SEASON_TZ || 9);   // シーズンが切り替わる時差(9 = 日本時間の毎月1日0時)
+const DEV_USERS = new Set(String(process.env.DEV_USERS || '').split(',').map(s => s.trim().normalize('NFKC').toLowerCase()).filter(Boolean));
 const MAX_MSG = 512 * 1024;
-const rooms = new Map();     // ワールド名 → { members: Map(id → ws), parties: Map(パーティー名 → { name, members: [id] }) }
-const stashes = new Map();   // ワールド名/パーティー名 → { ver, items: [{ item, w, h }] }
-let nextId = 1;
+const TRADE_MAX_ITEMS = 80;
+const rooms = new Map();     // リーグ:ワールド名 → { code, league, members: Map(id → ws), parties: Map(パーティー名 → { name, members: [id] }) }
+const trades = new Map();    // トレード番号 → { id, a, b, items: Map(id → [アイテム]), ok: Map(id → true), ver }
+let nextId = 1, nextTrade = 1;
+/** いまのシーズン: '2026-11' */
+function seasonKeyNow() { const d = new Date(Date.now() + SEASON_TZ * 3600000); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; }
+const isDev = user => !!user && DEV_USERS.has(user);
 
 /* ============================================================
  * 保存先(アカウントとセーブ)
@@ -70,7 +76,7 @@ function readBody(req, max) {
 }
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
 function json(res, code, o) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS }); res.end(JSON.stringify(o)); }
-function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 3, worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, storage: STORAGE, storageOk: kvCheck.ok, storageMsg: kvCheck.msg, storageHost: KV_URL ? KV_URL.replace(/^https?:\/\//, '') : '', game: fs.existsSync(GAME_FILE) }; }
+function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 4, now: Date.now(), season: seasonKeyNow(), worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, trades: trades.size, devUsers: DEV_USERS.size, storage: STORAGE, storageOk: kvCheck.ok, storageMsg: kvCheck.msg, storageHost: KV_URL ? KV_URL.replace(/^https?:\/\//, '') : '', game: fs.existsSync(GAME_FILE) }; }
 /** 保存先につながるか確かめる(起動時と /health を開いたとき) */
 async function checkKv() {
   if (!KV_URL) { kvCheck = { ok: true, msg: 'Upstash が設定されていないので、サーバーのファイルに保存します(サーバーが入れ替わると消えます)' }; return; }
@@ -99,17 +105,17 @@ async function api(req, res, url) {
         if (cur) { failed(ip); return json(res, 409, { error: 'そのIDはもう使われています' }); }
         const salt = crypto.randomBytes(16).toString('hex'), hash = await hashPass(pass, salt);
         await kv(['SET', userKey(user), JSON.stringify({ salt, hash, created: Date.now() })]);
-        return json(res, 200, { ok: true, user, token: await newToken(user) });
+        return json(res, 200, { ok: true, user, token: await newToken(user), dev: isDev(user), now: Date.now() });
       }
       if (!cur) { failed(ip); return json(res, 401, { error: 'IDかパスワードがちがいます' }); }
       const u = JSON.parse(cur), h = await hashPass(pass, u.salt);
       if (!crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(u.hash, 'hex'))) { failed(ip); return json(res, 401, { error: 'IDかパスワードがちがいます' }); }
-      return json(res, 200, { ok: true, user, token: await newToken(user) });
+      return json(res, 200, { ok: true, user, token: await newToken(user), dev: isDev(user), now: Date.now() });
     }
     if (url === '/api/logout') { const h = req.headers.authorization || ''; if (h.startsWith('Bearer ')) await kv(['DEL', tokKey(h.slice(7))]); return json(res, 200, { ok: true }); }
     if (url === '/api/save') {
       const user = await authUser(req); if (!user) return json(res, 401, { error: 'ログインし直してください' });
-      if (req.method === 'GET') { const s = await kv(['GET', saveKey(user)]); return json(res, 200, s ? { ok: true, user, ...JSON.parse(s) } : { ok: true, user, t: 0, data: null }); }
+      if (req.method === 'GET') { const s = await kv(['GET', saveKey(user)]); return json(res, 200, { ok: true, user, dev: isDev(user), now: Date.now(), ...(s ? JSON.parse(s) : { t: 0, data: null }) }); }
       if (req.method === 'POST') {
         const b = JSON.parse(await readBody(req, 4 * 1024 * 1024) || '{}');
         if (typeof b.data !== 'string' || !(b.t > 0)) return json(res, 400, { error: 'セーブの形が正しくありません' });
@@ -145,17 +151,59 @@ function leaveParty(r, ws) {
   p.members = p.members.filter(id => id !== ws.id);
   if (!p.members.length) r.parties.delete(p.name);
 }
-function stashKey(ws) { return ws.room + '/' + ws.party; }
-function sendStash(r, ws, onlyTo) {
-  const st = stashes.get(stashKey(ws)) || { ver: 0, items: [] };
-  const o = JSON.stringify({ t: 'ps', party: ws.party, ver: st.ver, items: st.items.map(x => x.item) });
-  if (onlyTo) return send(ws, o);
-  const p = partyOf(r, ws); if (p) for (const id of p.members) send(r.members.get(id), o);
+/* ---------- トレード ---------- */
+const TRADE_TYPES = ['equip', 'gem', 'rune', 'currency'];
+const tradeOf = ws => (ws.trade ? trades.get(ws.trade) : null);
+function tradeState(t) {
+  for (const [me, other] of [[t.a, t.b], [t.b, t.a]]) send(me, { t: 'trade', op: 'state', tid: t.id, theirs: t.items.get(other.id) || [], okMine: !!t.ok.get(me.id), okTheirs: !!t.ok.get(other.id), ver: t.ver });
 }
-const overlap = (a, b) => a.item.gx < b.item.gx + b.w && b.item.gx < a.item.gx + a.w && a.item.gy < b.item.gy + b.h && b.item.gy < a.item.gy + a.h;
+function endTrade(t, msg, except) {
+  trades.delete(t.id);
+  for (const p of [t.a, t.b]) { if (p.trade === t.id) p.trade = null; if (p !== except) send(p, { t: 'trade', op: 'closed', tid: t.id, msg }); }
+}
+function onTrade(r, ws, m) {
+  const fail = msg => send(ws, { t: 'trade', op: 'fail', msg });
+  if (m.op === 'ask') {
+    const to = r.members.get(m.to);
+    if (!to || to === ws) return fail('相手がワールドにいません');
+    if (ws.trade) return fail('いまトレード中です');
+    if (to.trade) return fail(`${to.name} はほかの人とトレード中です`);
+    to.tradeAsk = { from: ws.id, at: Date.now() };
+    send(to, { t: 'trade', op: 'asked', from: ws.id, name: ws.name }); send(ws, { t: 'trade', op: 'sent', name: to.name });
+    return;
+  }
+  if (m.op === 'answer') {
+    const ask = ws.tradeAsk, from = r.members.get(m.from); ws.tradeAsk = null;
+    if (!ask || ask.from !== m.from || Date.now() - ask.at > 120000 || !from) return fail('申し込みの期限が切れました');
+    if (!m.yes) return send(from, { t: 'trade', op: 'declined', name: ws.name });
+    if (from.trade || ws.trade) return fail('どちらかがほかの人とトレード中です');
+    const t = { id: nextTrade++, a: from, b: ws, items: new Map(), ok: new Map(), ver: 1 };
+    trades.set(t.id, t); from.trade = ws.trade = t.id;
+    send(from, { t: 'trade', op: 'open', tid: t.id, with: ws.id, name: ws.name }); send(ws, { t: 'trade', op: 'open', tid: t.id, with: from.id, name: from.name });
+    return tradeState(t);
+  }
+  const t = tradeOf(ws); if (!t || t.id !== m.tid) return;
+  if (m.op === 'offer') {   // 出す物が変わった: 両方の OK を取り消す
+    const items = Array.isArray(m.items) ? m.items : null;
+    if (!items || items.length > TRADE_MAX_ITEMS || !items.every(it => it && typeof it === 'object' && typeof it.uid === 'string' && TRADE_TYPES.includes(it.type))) return fail('出す物が正しくありません');
+    t.items.set(ws.id, items); t.ok.clear(); t.ver++; return tradeState(t);
+  }
+  if (m.op === 'ok') {
+    if (m.ver !== t.ver) return tradeState(t);   // 相手が中身を変えたばかり: もう一度見てもらう
+    t.ok.set(ws.id, true);
+    if (t.ok.get(t.a.id) && t.ok.get(t.b.id)) {   // 成立: おたがいの出した物を渡す
+      trades.delete(t.id); t.a.trade = t.b.trade = null;
+      send(t.a, { t: 'trade', op: 'done', tid: t.id, got: t.items.get(t.b.id) || [] });
+      send(t.b, { t: 'trade', op: 'done', tid: t.id, got: t.items.get(t.a.id) || [] });
+      return;
+    }
+    return tradeState(t);
+  }
+  if (m.op === 'cancel') return endTrade(t, `${ws.name} がトレードをやめました(出した物は持ち物に戻りました)`, ws);
+}
 
 wss.on('connection', ws => {
-  ws.id = nextId++; ws.alive = true; ws.room = null; ws.name = ''; ws.party = null;
+  ws.id = nextId++; ws.alive = true; ws.room = null; ws.name = ''; ws.party = null; ws.trade = null;
   ws.on('pong', () => { ws.alive = true; });
   ws.on('message', (buf, isBinary) => {
     if (isBinary) return;
@@ -163,13 +211,16 @@ wss.on('connection', ws => {
     if (m.t === 'join') {
       if (ws.room) return;
       const code = cleanRoom(m.room); if (!code) return send(ws, { t: 'error', msg: 'ワールドの合言葉が空です' });
-      let r = rooms.get(code);
-      if (!r) { r = { members: new Map(), parties: new Map() }; rooms.set(code, r); }
+      const league = m.league == null || m.league === 'std' ? 'std' : String(m.league);
+      if (league !== 'std' && league !== seasonKeyNow()) return send(ws, { t: 'error', msg: 'このキャラのシーズンはもう終わっています。ゲームを読み込み直すと、永続リーグへ移ります' });
+      const key = league + ':' + code;
+      let r = rooms.get(key);
+      if (!r) { r = { code, league, members: new Map(), parties: new Map() }; rooms.set(key, r); }
       if (r.members.size >= MAX_PLAYERS) return send(ws, { t: 'error', msg: `このワールドはいっぱいです(${MAX_PLAYERS}人まで)` });
-      ws.room = code; ws.name = cleanName(m.name) || '冒険者';
+      ws.room = key; ws.name = cleanName(m.name) || '冒険者';
       const peers = [...r.members.values()].map(p => ({ id: p.id, name: p.name, party: p.party }));
       r.members.set(ws.id, ws);
-      send(ws, { t: 'welcome', id: ws.id, room: code, peers, parties: partyList(r), partyMax: PARTY_MAX });
+      send(ws, { t: 'welcome', id: ws.id, room: code, league, peers, parties: partyList(r), partyMax: PARTY_MAX });
       for (const p of r.members.values()) if (p !== ws) send(p, { t: 'peer+', id: ws.id, name: ws.name });
       return;
     }
@@ -184,7 +235,7 @@ wss.on('connection', ws => {
           leaveParty(r, ws);
           if (!p) { p = { name, members: [] }; r.parties.set(name, p); }
           p.members.push(ws.id); ws.party = name;
-          sendParties(r); sendStash(r, ws, true);
+          sendParties(r);
         } else if (m.op === 'leave') { leaveParty(r, ws); sendParties(r); }
         return;
       }
@@ -203,37 +254,11 @@ wss.on('connection', ws => {
         else { const pt = partyOf(r, ws); if (pt) for (const id of pt.members) send(r.members.get(id), out); }
         return;
       }
-      case 'ps': {   // パーティー倉庫
-        if (!ws.party) return send(ws, { t: 'error', soft: 1, msg: 'パーティーに入ると使えます' });
-        const key = stashKey(ws); let st = stashes.get(key);
-        if (m.op === 'sync') {   // 各自のゲームの控えで、サーバーが空のときだけ元に戻す
-          if ((!st || (!st.items.length && st.ver === 0)) && Array.isArray(m.items) && m.ver > 0) {
-            st = { ver: m.ver, items: m.items.filter(it => it && it.uid && Number.isInteger(it.gx) && Number.isInteger(it.gy)).slice(0, STASH_W * STASH_H).map(it => ({ item: it, w: Math.max(1, Math.min(4, it.__w || 1)), h: Math.max(1, Math.min(4, it.__h || 1)) })) };
-            stashes.set(key, st); sendStash(r, ws); return;
-          }
-          return sendStash(r, ws, true);
-        }
-        if (!st) { st = { ver: 0, items: [] }; stashes.set(key, st); }
-        if (m.op === 'put') {
-          const it = m.item, w = Math.max(1, Math.min(4, m.w | 0)), h = Math.max(1, Math.min(4, m.h | 0));
-          const fail = msg => send(ws, { t: 'ps_fail', item: it, msg });
-          if (!it || !it.uid || !Number.isInteger(it.gx) || !Number.isInteger(it.gy)) return fail('アイテムが正しくありません');
-          if (it.gx < 0 || it.gy < 0 || it.gx + w > STASH_W || it.gy + h > STASH_H) return fail('倉庫のマスからはみ出しています');
-          it.__w = w; it.__h = h;
-          const e = { item: it, w, h };
-          if (st.items.some(x => x.item.uid === it.uid || overlap(x, e))) return fail('そこには置けません');
-          st.items.push(e); st.ver++; sendStash(r, ws);
-        } else if (m.op === 'take') {
-          const k = st.items.findIndex(x => x.item.uid === m.uid);
-          if (k < 0) { send(ws, { t: 'error', soft: 1, msg: 'ほかの人が先に取りました' }); return sendStash(r, ws, true); }
-          const [e] = st.items.splice(k, 1); st.ver++;
-          send(ws, { t: 'ps_took', item: e.item }); sendStash(r, ws);
-        }
-        return;
-      }
+      case 'trade': return onTrade(r, ws, m);
     }
   });
   ws.on('close', () => {
+    const t = tradeOf(ws); if (t) endTrade(t, `${ws.name} がいなくなったため、トレードをやめました(出した物は持ち物に戻りました)`, ws);
     const r = ws.room && rooms.get(ws.room); if (!r) return;
     const hadParty = !!ws.party; leaveParty(r, ws);
     r.members.delete(ws.id);
@@ -244,4 +269,4 @@ wss.on('connection', ws => {
 });
 
 setInterval(() => { for (const ws of wss.clients) { if (!ws.alive) { ws.terminate(); continue; } ws.alive = false; ws.ping(); } }, 25000);
-server.listen(PORT, () => console.log(`abyss-relay v3 listening on ${PORT} (storage: ${STORAGE})`));
+server.listen(PORT, () => console.log(`abyss-relay v4 listening on ${PORT} (storage: ${STORAGE}, dev users: ${DEV_USERS.size})`));

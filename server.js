@@ -24,7 +24,19 @@ let nextId = 1;
  *   Render の「Environment」に UPSTASH_REDIS_REST_URL と UPSTASH_REDIS_REST_TOKEN があれば Upstash(無料・消えない)
  *   なければサーバーのファイル(無料プランでは、サーバーが入れ替わると消える)
  * ============================================================ */
-const KV_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, ''), KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+/** 貼りまちがいを直す: 前後の空白・引用符、https:// のつけ忘れ、redis://〜(接続用の文字)を貼った場合 */
+function fixKv() {
+  let url = String(process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/^["']|["']$/g, '').trim();
+  let token = String(process.env.UPSTASH_REDIS_REST_TOKEN || '').trim().replace(/^["']|["']$/g, '').trim();
+  const m = /^rediss?:\/\/(?:[^:@\/]*:)?([^@\/]+)@([^:\/]+)(?::\d+)?/i.exec(url);   // rediss://default:TOKEN@host:6379
+  if (m) { if (!token) token = m[1]; url = 'https://' + m[2]; }
+  url = url.replace(/^UPSTASH_REDIS_REST_URL\s*=\s*/i, '').replace(/:\d+\/?$/, '');
+  if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+  token = token.replace(/^UPSTASH_REDIS_REST_TOKEN\s*=\s*/i, '');
+  return { url: url.replace(/\/+$/, ''), token };
+}
+const { url: KV_URL, token: KV_TOKEN } = fixKv();
+let kvCheck = { ok: null, msg: '' };
 const FILE_DB = path.join(__dirname, 'data.json');
 let fileDb = null;
 function fileLoad() { if (!fileDb) { try { fileDb = JSON.parse(fs.readFileSync(FILE_DB, 'utf8')); } catch (e) { fileDb = {}; } } return fileDb; }
@@ -58,7 +70,19 @@ function readBody(req, max) {
 }
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
 function json(res, code, o) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS }); res.end(JSON.stringify(o)); }
-function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 3, worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, storage: STORAGE, game: fs.existsSync(GAME_FILE) }; }
+function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 3, worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, storage: STORAGE, storageOk: kvCheck.ok, storageMsg: kvCheck.msg, storageHost: KV_URL ? KV_URL.replace(/^https?:\/\//, '') : '', game: fs.existsSync(GAME_FILE) }; }
+/** 保存先につながるか確かめる(起動時と /health を開いたとき) */
+async function checkKv() {
+  if (!KV_URL) { kvCheck = { ok: true, msg: 'Upstash が設定されていないので、サーバーのファイルに保存します(サーバーが入れ替わると消えます)' }; return; }
+  try {
+    const r = await fetch(KV_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + KV_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(['PING']) });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401 || r.status === 403) kvCheck = { ok: false, msg: 'Upstash に断られました。UPSTASH_REDIS_REST_TOKEN が合っているか確かめてください' };
+    else if (j.result === 'PONG') kvCheck = { ok: true, msg: 'Upstash につながっています' };
+    else kvCheck = { ok: false, msg: 'Upstash から予想外の返事: ' + JSON.stringify(j).slice(0, 120) };
+  } catch (e) { kvCheck = { ok: false, msg: `Upstash(${KV_URL.replace(/^https?:\/\//, '')})につながりません。UPSTASH_REDIS_REST_URL が「https://○○.upstash.io」の形か確かめてください(${e.cause && e.cause.code || e.message})` }; }
+}
+checkKv();
 const GAME_FILE = path.join(__dirname, 'abyss-arpg.html');
 
 async function api(req, res, url) {
@@ -94,7 +118,7 @@ async function api(req, res, url) {
       }
     }
     return json(res, 404, { error: 'not found' });
-  } catch (e) { console.error(e); return json(res, 500, { error: 'サーバーでエラーが起きました: ' + e.message }); }
+  } catch (e) { console.error(e); if (KV_URL && /fetch failed|ENOTFOUND|ECONN|parse URL/i.test(e.message + (e.cause ? e.cause.code : ''))) { await checkKv(); return json(res, 503, { error: 'セーブの保存先(Upstash)につながりません。' + kvCheck.msg }); } return json(res, 500, { error: 'サーバーでエラーが起きました: ' + e.message }); }
 }
 
 const server = http.createServer((req, res) => {
@@ -105,6 +129,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
     return fs.createReadStream(GAME_FILE).pipe(res);
   }
+  if (url === '/health') return checkKv().then(() => json(res, 200, status()));
   return json(res, 200, status());
 });
 const wss = new WebSocketServer({ server, maxPayload: MAX_MSG });

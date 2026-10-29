@@ -8437,7 +8437,10 @@ function cloudSaveToken() { try { if (CLOUD.token) localStorage.setItem(CLOUD_KE
 async function cloudFetch(path, opts = {}) {
   const base = cloudBase(); if (!base) throw new Error('サーバーの住所がありません(👥 マルチの画面か、Excelの基本設定 netServer に入れてください)');
   const headers = { 'Content-Type': 'application/json' }; if (CLOUD.token) headers.Authorization = 'Bearer ' + CLOUD.token;
-  const r = await fetch(base + path, { ...opts, headers: { ...headers, ...(opts.headers || {}) }, cache: 'no-store' });
+  const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 30000);
+  let r; try { r = await fetch(base + path, { ...opts, headers: { ...headers, ...(opts.headers || {}) }, cache: 'no-store', signal: opts.keepalive ? undefined : ctl.signal }); }
+  catch (e) { clearTimeout(tm); throw new Error(e.name === 'AbortError' ? 'サーバーから返事がありません(30秒)。少し待ってもう一度' : `サーバー(${base})につながりません`); }
+  clearTimeout(tm);
   let j = {}; try { j = await r.json(); } catch (e) { }
   if (r.status === 401 && path === '/api/save') { CLOUD.token = ''; CLOUD.user = ''; cloudSaveToken(); }
   if (!r.ok) throw new Error(j.error || ('エラー ' + r.status));
@@ -8499,14 +8502,18 @@ async function cloudSync(ask) {
 }
 async function cloudLogin(register) {
   const u = $('#acc-user'), p = $('#acc-pass'); if (!u || !p) return;
-  CLOUD.status = register ? '登録しています…' : 'ログインしています…'; renderPanel();
+  const user = u.value, pass = p.value; CLOUD.user = user;
+  if (CLOUD.busyLogin) return; CLOUD.busyLogin = true;
+  CLOUD.status = register ? '登録しています…' : 'ログインしています…'; cloudShowStatus();
   try {
     await netWake();
-    const j = await cloudFetch(register ? '/api/register' : '/api/login', { method: 'POST', body: JSON.stringify({ user: u.value, pass: p.value }) });
+    CLOUD.status = register ? '登録しています…' : 'ログインしています…'; cloudShowStatus();
+    const j = await cloudFetch(register ? '/api/register' : '/api/login', { method: 'POST', body: JSON.stringify({ user, pass }) });
+    CLOUD.busyLogin = false;
     CLOUD.user = j.user; CLOUD.token = j.token; cloudSaveToken(); CLOUD.status = '';
     toast(`☁ ${esc(j.user)} でログインしました。セーブは自動でクラウドに保存されます`, 'gold', 5000);
     renderPanel(); await cloudSync(true);
-  } catch (e) { CLOUD.status = '⚠ ' + e.message; renderPanel(); }
+  } catch (e) { CLOUD.busyLogin = false; CLOUD.status = '⚠ ' + e.message; renderPanel(); }
 }
 async function cloudLogout() {
   if (CLOUD.dirty) await cloudUpload();
@@ -8514,13 +8521,18 @@ async function cloudLogout() {
   CLOUD.user = ''; CLOUD.token = ''; cloudSaveToken(); CLOUD.status = 'ログアウトしました'; renderPanel();
 }
 /** 無料サーバーは眠っていることがあるので、起こしてから */
+function cloudShowStatus() { const st = $('#acc-status'); if (st) st.innerHTML = CLOUD.status || ''; else if (panelName === 'account') renderPanel(); }
 async function netWake() {
-  const base = cloudBase(); if (!base) throw new Error('サーバーの住所がありません');
-  const t0 = Date.now();
+  const t0 = Date.now(); let tries = 0;
   for (;;) {
-    try { const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 15000); const r = await fetch(base + '/health', { signal: ctl.signal, cache: 'no-store' }); clearTimeout(tm); if (r.ok) return true; } catch (e) { }
-    if (Date.now() - t0 > 100000) throw new Error('サーバーにつながりませんでした');
-    CLOUD.status = 'サーバーを起こしています…(最大1分)'; if (panelName === 'account') renderPanel();
+    const base = cloudBase(); if (!base) throw new Error('サーバーの住所がありません');
+    try { const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 12000); const r = await fetch(base + '/health', { signal: ctl.signal, cache: 'no-store' }); clearTimeout(tm); if (r.ok) { const j = await r.json().catch(() => null); if (j && j.name === 'abyss-relay') { CLOUD.status = ''; return true; } } } catch (e) { }
+    tries++;
+    // 保存されている住所がまちがっていそうなら、基本設定の住所(Excel の netServer)も試す
+    if (tries === 2 && state.settings.netUrl && B.netServer && netHttpUrl(state.settings.netUrl) !== netHttpUrl(B.netServer)) { CLOUD.oldUrl = state.settings.netUrl; state.settings.netUrl = ''; save(); }
+    const sec = Math.round((Date.now() - t0) / 1000);
+    if (sec > 100) { if (CLOUD.oldUrl) { state.settings.netUrl = CLOUD.oldUrl; CLOUD.oldUrl = ''; save(); } throw new Error(`サーバー(${base})につながりませんでした。住所が合っているか、下の「サーバーの住所」を確かめてください`); }
+    CLOUD.status = `サーバーを起こしています… ${sec}秒(無料サーバーは最大1分ほどかかります)<br><small>${esc(base)}</small>`; cloudShowStatus();
     await new Promise(r => setTimeout(r, 3000));
   }
 }
@@ -8541,13 +8553,14 @@ PANELS.account = {
       h += '<p class="small">パスワードはサーバーに暗号化して保存されます。ほかのサイトと同じパスワードは使わないでください。</p>';
       if (!state.char && makeState) h += '<p><button class="btn" data-act="open" data-arg="title">ログインしないで始める ▶</button></p>';
     }
-    if (!cloudBase()) h += '<p class="small" style="color:#FFB36A">サーバーの住所が入っていません。👥 マルチの画面で住所を入れてください。</p>';
-    if (CLOUD.status) h += `<p class="small" style="color:#FFB36A">${CLOUD.status}</p>`;
+    h += `<details ${cloudBase() ? '' : 'open'}><summary class="small">サーバーの住所: ${esc(cloudBase() || 'なし')}</summary><div class="netform"><input id="acc-url" type="text" value="${esc(state.settings.netUrl || '')}" placeholder="${esc(B.netServer || 'https://○○.onrender.com')}"></div><button class="btn sm" data-act="cloudurl">住所を変える</button> <small>空欄にすると初期値(${esc(B.netServer || 'なし')})</small></details>`;
+    h += `<p id="acc-status" class="small" style="color:#FFB36A">${CLOUD.status || ''}</p>`;
     return h;
   },
 };
 Object.assign(panelActs, {
   cloudin: () => cloudLogin(false), cloudreg: () => cloudLogin(true),
+  cloudurl: () => { const v = ($('#acc-url') || {}).value || ''; state.settings.netUrl = v.trim(); save(); CLOUD.status = '住所を変えました: ' + esc(cloudBase() || 'なし'); renderPanel(); },
   cloudout: () => cloudLogout(), cloudup: () => { save(); cloudUpload(); }, cloudsync: () => cloudSync(true),
 });
 /** 起動時: ログインしていればサーバーと合わせる */

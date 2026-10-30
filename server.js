@@ -24,6 +24,13 @@ let nextId = 1, nextTrade = 1;
 /** いまのシーズン: '2026-11' */
 function seasonKeyNow() { const d = new Date(Date.now() + SEASON_TZ * 3600000); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; }
 const isDev = user => !!user && DEV_USERS.has(user);
+/* ---------- 古い版のゲームを断る ----------
+ *   新しい版のゲームは、ログイン・セーブでは X-Game-Version ヘッダー、ワールドでは join の ver に版を付けてくる。
+ *   版がない・MIN_GAME_VERSION より古いものは断る(古い形のセーブで新しいセーブを上書きしないように) */
+const MIN_GAME_VERSION = String(process.env.MIN_GAME_VERSION || '2.12.1');
+const vnum = s => String(s || '0').split('.').map(x => parseInt(x, 10) || 0).reduce((a, b) => a * 1000 + b, 0);
+const OLD_MSG = `このゲームは古い版です。https://abyss-relay.onrender.com をブラウザで開いて遊んでください(ログインすれば、セーブはそのまま続きから使えます)`;
+const oldGame = v => !v || vnum(v) < vnum(MIN_GAME_VERSION);
 
 /* ============================================================
  * 保存先(アカウントとセーブ)
@@ -74,9 +81,9 @@ async function authUser(req) { const h = req.headers.authorization || ''; const 
 function readBody(req, max) {
   return new Promise((ok, ng) => { let n = 0; const ch = []; req.on('data', d => { n += d.length; if (n > max) { ng(new Error('too large')); req.destroy(); } else ch.push(d); }); req.on('end', () => ok(Buffer.concat(ch).toString('utf8'))); req.on('error', ng); });
 }
-const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Game-Version', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
 function json(res, code, o) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS }); res.end(JSON.stringify(o)); }
-function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 4, now: Date.now(), season: seasonKeyNow(), worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, trades: trades.size, devUsers: DEV_USERS.size, storage: STORAGE, storageOk: kvCheck.ok, storageMsg: kvCheck.msg, storageHost: KV_URL ? KV_URL.replace(/^https?:\/\//, '') : '', game: fs.existsSync(GAME_FILE) }; }
+function status() { let players = 0; for (const r of rooms.values()) players += r.members.size; return { ok: true, name: 'abyss-relay', version: 4, now: Date.now(), minGame: MIN_GAME_VERSION, season: seasonKeyNow(), worlds: rooms.size, players, max: MAX_PLAYERS, partyMax: PARTY_MAX, trades: trades.size, devUsers: DEV_USERS.size, storage: STORAGE, storageOk: kvCheck.ok, storageMsg: kvCheck.msg, storageHost: KV_URL ? KV_URL.replace(/^https?:\/\//, '') : '', game: fs.existsSync(GAME_FILE) }; }
 /** 保存先につながるか確かめる(起動時と /health を開いたとき) */
 async function checkKv() {
   if (!KV_URL) { kvCheck = { ok: true, msg: 'Upstash が設定されていないので、サーバーのファイルに保存します(サーバーが入れ替わると消えます)' }; return; }
@@ -94,6 +101,7 @@ const GAME_FILE = path.join(__dirname, 'abyss-arpg.html');
 async function api(req, res, url) {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   try {
+    if (url !== '/api/logout' && oldGame(req.headers['x-game-version'])) return json(res, 426, { error: OLD_MSG, old: true });
     if (url === '/api/register' || url === '/api/login') {
       if (req.method !== 'POST') return json(res, 405, { error: 'POST で送ってください' });
       if (tooMany(ip)) return json(res, 429, { error: '失敗が多すぎます。10分ほど待ってください' });
@@ -210,6 +218,7 @@ wss.on('connection', ws => {
     let m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
     if (m.t === 'join') {
       if (ws.room) return;
+      if (oldGame(m.ver)) return send(ws, { t: 'error', msg: OLD_MSG });
       const code = cleanRoom(m.room); if (!code) return send(ws, { t: 'error', msg: 'ワールドの合言葉が空です' });
       const league = m.league == null || m.league === 'std' ? 'std' : String(m.league);
       if (league !== 'std' && league !== seasonKeyNow()) return send(ws, { t: 'error', msg: 'このキャラのシーズンはもう終わっています。ゲームを読み込み直すと、永続リーグへ移ります' });

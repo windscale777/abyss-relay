@@ -7969,6 +7969,8 @@ function mapBackground(style, nodes) {
   }
   return svg;
 }
+/** 世界地図から出発できるか: ふつうは町から。開発者はエリアの中からでも */
+const canDepart = () => mode === 'town' || (mode === 'area' && CLOUD.dev && player.alive);
 const currentTownId = () => (state.char && TOWN_BY[state.char.town] ? state.char.town : TOWNS[0].id);
 PANELS.worldmap = {
   title: () => '🗺 世界地図 — 行き先を選ぶ', cls: 'wide map-panel',
@@ -8014,7 +8016,7 @@ PANELS.worldmap = {
     }
     // 選んだ場所の情報
     let info = '<p class="small">地図の場所をクリックすると、くわしい情報が出ます。上のタブで地方を切り替えられます。</p>';
-    const canGo = mode === 'town';
+    const canGo = canDepart();
     const goNote = canGo ? '' : '<p class="small" style="color:#FFB36A">出発は町の「深淵の門」から行えます(T で町へ)</p>';
     const node = nodes.find(n => n.id === sel);
     if (node && node.area) {
@@ -8070,10 +8072,10 @@ Object.assign(panelActs, {
     const nextT = (D.trials || []).find(t => !state.char.asc.trials[t.id]) || (D.trials || [])[0];
     panelOpts.sel = id === 'abyss' ? 'abyss' : id === 'heist' ? 'heist' : id === 'trial' && nextT ? 'trial:' + nextT.id : null; renderPanel();
   },
-  travel: id => { if (mode !== 'town') return; const T = TOWN_BY[id]; if (!T || !townUnlocked(T) || T.id === currentTownId()) return; forceClosePanel(); SFX.portal(); enterTown(T.id); },
-  go: id => { if (mode !== 'town') return; if (netIsGuest()) { toast('👥 パーティーでは、行き先はリーダーが決めます(パーティーを抜けると一人で遊べます)'); return; } const a = D.areas.find(x => x.id === id); if (!a || !areaUnlocked(a)) return; if (dailyRunsLeft(a) <= 0) { toast(`「${esc(a.name)}」には今日はもう入れません(毎日 ${a.dailyRuns} 回まで。明日また来よう)`); SFX.deny(); return; } useDailyRun(a); forceClosePanel(); instance = null; const A = makeStoryArea(a); if (state.char.progress.cleared[a.id] && !a.dailyRuns) addReplayMods(A); enterArea(A); },
+  travel: id => { if (!canDepart()) return; const T = TOWN_BY[id]; if (!T || !townUnlocked(T) || (mode === 'town' && T.id === currentTownId())) return; forceClosePanel(); SFX.portal(); enterTown(T.id); },
+  go: id => { if (!canDepart()) return; if (netIsGuest()) { toast('👥 パーティーでは、行き先はリーダーが決めます(パーティーを抜けると一人で遊べます)'); return; } const a = D.areas.find(x => x.id === id); if (!a || !areaUnlocked(a)) return; if (dailyRunsLeft(a) <= 0) { toast(`「${esc(a.name)}」には今日はもう入れません(毎日 ${a.dailyRuns} 回まで。明日また来よう)`); SFX.deny(); return; } useDailyRun(a); forceClosePanel(); instance = null; const A = makeStoryArea(a); if (state.char.progress.cleared[a.id] && !a.dailyRuns) addReplayMods(A); enterArea(A); },
   tier: t => { panelOpts.tier = +t; renderPanel(); },
-  abyss: t => { if (mode !== 'town' || !abyssUnlocked()) return; if (netIsGuest()) { toast('👥 パーティーでは、行き先はホストが決めます'); return; } const c = state.char; forceClosePanel(); instance = null; enterArea(makeAbyss(+t, c.progress.abyssSeed || 1)); c.progress.abyssSeed = Math.floor(Math.random() * 1e6); },
+  abyss: t => { if (!canDepart() || !abyssUnlocked()) return; if (netIsGuest()) { toast('👥 パーティーでは、行き先はホストが決めます'); return; } const c = state.char; forceClosePanel(); instance = null; enterArea(makeAbyss(+t, c.progress.abyssSeed || 1)); c.progress.abyssSeed = Math.floor(Math.random() * 1e6); },
   reroll_abyss: () => { const c = state.char; if (spendCurrency(c, 'c_chaos', 1)) { c.progress.abyssSeed = Math.floor(Math.random() * 1e6); SFX.craft(true); renderPanel(); } },
 });
 
@@ -9702,7 +9704,7 @@ function trialInfo(t, canGo, goNote) {
   return h + (canGo ? `<button class="btn gold" data-act="trial_go" data-arg="${t.id}">⚔ 試練に挑む</button>` : goNote);
 }
 panelActs.trial_go = id => {
-  const t = TRIAL_BY[id], c = state.char; if (mode !== 'town' || !t || !trialOpen(c, t)) return;
+  const t = TRIAL_BY[id], c = state.char; if (!canDepart() || !t || !trialOpen(c, t)) return;
   if (netIsGuest()) { toast('👥 パーティーでは、行き先はリーダーが決めます(パーティーを抜けると一人で遊べます)'); return; }
   forceClosePanel(); instance = null; enterArea(makeTrial(t));
 };
@@ -9874,7 +9876,7 @@ function heistInfo(canGo, goNote) {
   return h + (canGo ? `<button class="btn gold" data-act="heist_go" ${n > 0 ? '' : 'disabled'}>🗝 ${esc(cn)}を使って忍び込む</button>` : goNote);
 }
 panelActs.heist_go = () => {
-  const c = state.char; if (mode !== 'town') return;
+  const c = state.char; if (!canDepart()) return;
   if (NET.party) { toast('🗝 怪盗ミッションは一人で行います(パーティーを抜けると挑めます)'); SFX.deny(); return; }
   if (c.level < (B.heistMinLevel || 1)) return;
   if (!spendCurrency(c, 'c_contract', 1)) { toast(`${esc(CUR.c_contract ? CUR.c_contract.name : '契約書')}がありません`); SFX.deny(); return; }

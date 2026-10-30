@@ -8639,6 +8639,7 @@ function renderParty() {
 PANELS.net = {
   title: () => '👥 マルチプレイ',
   body() {
+    if (isWebPage()) return webPageNote('マルチプレイとトレード');
     const url = netServerUrl(), last = state.settings.netRoom || '';
     let h = '';
     const lg = state.char ? state.char.league || 'std' : 'std';
@@ -8809,9 +8810,13 @@ async function netWake() {
     await new Promise(r => setTimeout(r, 3000));
   }
 }
+/** Webページ版(claude.ai)か。このページは外のサーバーと通信できないので、ログインとマルチは使えない */
+const isWebPage = () => !!(window.claude && window.claude.use);
+const webPageNote = what => `<div class="qinfo season"><b>⚠ このページ(claude.ai 版)では${what}を使えません</b><br><small>外のサーバーと通信できないページだからです。${what}を使うには、ブラウザの新しいタブで次の住所を開いてください(新規登録もそちらからできます)。</small><br><a href="${esc(B.netServer)}" target="_blank" rel="noopener" style="color:#FFE07A;font-size:15px">${esc(B.netServer)}</a></div>`;
 PANELS.account = {
   title: () => '☁ アカウント(クラウドセーブ)',
   body() {
+    if (isWebPage()) return webPageNote('ログインと新規登録') + '<p class="small">このページのセーブは、このブラウザの中だけに残ります。</p>' + (!state.char && makeState ? '<p><button class="btn gold" data-act="open" data-arg="title">ログインしないで始める ▶</button></p>' : '');
     let h = '';
     if (CLOUD.token) {
       h += `<p>☁ <b>${esc(CLOUD.user)}</b> でログインしています。</p><p class="small">セーブは自動でサーバーに保存されます(20秒ごと・ゲームを閉じたとき)。ほかのパソコンやスマホのブラウザでも、同じIDとパスワードでログインすれば続きから遊べます。ファイルを保存する必要はありません。</p>`;
@@ -8838,6 +8843,7 @@ Object.assign(panelActs, {
 });
 /** 起動時: ログインしていればサーバーと合わせる */
 async function cloudBoot() {
+  if (isWebPage()) return;
   // サーバーから開いたか(そのサーバーのアカウントを使う)
   if (/^https?:$/.test(location.protocol)) { try { const r = await fetch(location.origin + '/health', { cache: 'no-store' }); const j = await r.json(); CLOUD.sameOrigin = j && j.name === 'abyss-relay'; if (CLOUD.sameOrigin) noteServerTime(j); } catch (e) { } }
   cloudLoadToken();

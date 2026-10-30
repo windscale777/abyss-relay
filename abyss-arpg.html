@@ -8707,7 +8707,8 @@ function cloudSetDev(v) {
 }
 async function cloudFetch(path, opts = {}) {
   const base = cloudBase(); if (!base) throw new Error('サーバーの住所がありません(👥 マルチの画面か、Excelの基本設定 netServer に入れてください)');
-  const headers = { 'Content-Type': 'application/json', 'X-Game-Version': DEFAULT_DATA.version };   // 版: サーバーは古い版のゲームを断る if (CLOUD.token) headers.Authorization = 'Bearer ' + CLOUD.token;
+  const headers = { 'Content-Type': 'application/json', 'X-Game-Version': DEFAULT_DATA.version };   // 版: サーバーは古い版のゲームを断る
+  if (CLOUD.token) headers.Authorization = 'Bearer ' + CLOUD.token;
   const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 30000);
   let r; try { r = await fetch(base + path, { ...opts, headers: { ...headers, ...(opts.headers || {}) }, cache: 'no-store', signal: opts.keepalive ? undefined : ctl.signal }); }
   catch (e) { clearTimeout(tm); throw new Error(e.name === 'AbortError' ? 'サーバーから返事がありません(30秒)。少し待ってもう一度' : `サーバー(${base})につながりません`); }

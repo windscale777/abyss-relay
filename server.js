@@ -27,7 +27,7 @@ const isDev = user => !!user && DEV_USERS.has(user);
 /* ---------- 古い版のゲームを断る ----------
  *   新しい版のゲームは、ログイン・セーブでは X-Game-Version ヘッダー、ワールドでは join の ver に版を付けてくる。
  *   版がない・MIN_GAME_VERSION より古いものは断る(古い形のセーブで新しいセーブを上書きしないように) */
-const MIN_GAME_VERSION = String(process.env.MIN_GAME_VERSION || '2.12.1');
+const MIN_GAME_VERSION = String(process.env.MIN_GAME_VERSION || '2.13.0');
 const vnum = s => String(s || '0').split('.').map(x => parseInt(x, 10) || 0).reduce((a, b) => a * 1000 + b, 0);
 const OLD_MSG = `このゲームは古い版です。https://abyss-relay.onrender.com をブラウザで開いて遊んでください(ログインすれば、セーブはそのまま続きから使えます)`;
 const oldGame = v => !v || vnum(v) < vnum(MIN_GAME_VERSION);
